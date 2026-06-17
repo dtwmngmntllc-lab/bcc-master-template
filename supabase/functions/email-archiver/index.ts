@@ -393,7 +393,11 @@ async function ensureDriveFolderPath(opts: {
       }
 
       // Create the missing intermediate segment.
-      const createArgs: Record<string, any> = { name: segName };
+      // NOTE (V2.1 fix, 2026-06-17): The Composio GOOGLEDRIVE_CREATE_FOLDER
+      // runtime requires `folder_name`, not `name`. The published tool schema
+      // (via COMPOSIO_GET_TOOL_SCHEMAS) still shows `name` which is stale —
+      // verified empirically against connected_account ca_7eYFnY2De5QY.
+      const createArgs: Record<string, any> = { folder_name: segName };
       if (parentId) createArgs.parent_id = parentId;
       const createRes = await callComposio({
         apiKey: opts.apiKey,
@@ -799,10 +803,24 @@ Deno.serve(async (req: Request) => {
             throw new Error(`GMAIL_GET_ATTACHMENT failed for "${att.filename}" (http=${dlRes.httpStatus}): ${dlRes.error}`);
           }
           const fileObj: any = dlRes.data?.file || dlRes.data || {};
-          const s3key: string | undefined = fileObj?.s3key;
           const mimetypeFromDl: string | undefined = fileObj?.mimetype;
+          // NOTE (V2.2 fix, 2026-06-17): The Composio GMAIL_GET_ATTACHMENT
+          // runtime now returns `s3url` (a presigned R2 URL) instead of the
+          // legacy `s3key`. The downstream GOOGLEDRIVE_UPLOAD_FILE still
+          // expects `s3key`, so derive it by stripping the host and query
+          // string from the URL. Falls back to legacy `s3key` if present.
+          // Verified empirically against ca_p2KPGeQnUiBs on 2026-06-17.
+          let s3key: string | undefined = fileObj?.s3key;
+          const s3url: string | undefined = fileObj?.s3url;
+          if (!s3key && s3url) {
+            try {
+              s3key = new URL(s3url).pathname.replace(/^\//, "");
+            } catch {
+              // fall through to the error below
+            }
+          }
           if (!s3key) {
-            throw new Error(`GMAIL_GET_ATTACHMENT returned ok but no s3key for "${att.filename}". Raw: ${dlRes.raw.slice(0, 200)}`);
+            throw new Error(`GMAIL_GET_ATTACHMENT returned ok but no s3key or s3url for "${att.filename}". Raw: ${dlRes.raw.slice(0, 200)}`);
           }
 
           // Upload to Drive
@@ -877,24 +895,38 @@ Deno.serve(async (req: Request) => {
       }
     }
 
-    // --- Step N-1: batch label-modify only the successfully processed messages
+    // --- Step N-1: per-message label-modify for each successfully processed message.
+    // NOTE (V2.3 fix, 2026-06-17): GMAIL_BATCH_MODIFY_MESSAGES returns HTTP 404
+    // "Tool not found" via the v3 execute endpoint, despite being documented as
+    // available — the slug appears unrouted in the Composio project this
+    // function's API key is scoped to (workbench access works, raw v3 execute
+    // does not). Until that's resolved, the per-message GMAIL_ADD_LABEL_TO_EMAIL
+    // slug (which is routable) is called in a loop. Per-message errors are
+    // aggregated; modifyError is set only if at least one call failed.
     let modifyError: string | null = null;
+    const modifyFailures: Array<{ messageId: string; error: string }> = [];
     if (archivedMessageIds.length > 0) {
       const addLabels: string[] = addArchiveLabelId ? [addArchiveLabelId] : [];
       const removeLabels: string[] = ["INBOX"];
-      const modifyResult = await callComposio({
-        apiKey: composioApiKey,
-        userId: composioUserId,
-        connectedAccountId: gmailAccountId,
-        toolSlug: "GMAIL_BATCH_MODIFY_MESSAGES",
-        toolArguments: {
-          messageIds: archivedMessageIds,
-          addLabelIds: addLabels,
-          removeLabelIds: removeLabels,
-        },
-      });
-      if (!modifyResult.ok) {
-        modifyError = `GMAIL_BATCH_MODIFY_MESSAGES failed (http=${modifyResult.httpStatus}): ${modifyResult.error}`;
+      for (const mid of archivedMessageIds) {
+        const modRes = await callComposio({
+          apiKey: composioApiKey,
+          userId: composioUserId,
+          connectedAccountId: gmailAccountId,
+          toolSlug: "GMAIL_ADD_LABEL_TO_EMAIL",
+          toolArguments: {
+            message_id: mid,
+            add_label_ids: addLabels,
+            remove_label_ids: removeLabels,
+          },
+        });
+        if (!modRes.ok) {
+          modifyFailures.push({ messageId: mid, error: `http=${modRes.httpStatus}: ${modRes.error}` });
+        }
+      }
+      if (modifyFailures.length > 0) {
+        modifyError = `GMAIL_ADD_LABEL_TO_EMAIL failed for ${modifyFailures.length}/${archivedMessageIds.length} messages: ` +
+          modifyFailures.slice(0, 3).map((f) => `${f.messageId}=${f.error}`).join("; ");
       }
     }
 

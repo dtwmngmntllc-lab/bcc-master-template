@@ -1,5 +1,6 @@
 // =========================================================================
 // social-media-scheduler  (BCC Master Template — multi-platform posting)
+// VERSION: V2 — adds LinkedIn image posts (native upload flow)
 // =========================================================================
 // PURPOSE: Iterate today's content_calendar rows and post each one to the
 //   right platform via Composio. Marks status='posted' on success,
@@ -17,8 +18,9 @@
 //     5. If connection → dispatch to the right Composio tool:
 //          facebook + media_url   → FACEBOOK_CREATE_PHOTO_POST
 //          facebook + no media    → FACEBOOK_CREATE_POST
+//          linkedin + media       → INITIALIZE_IMAGE_UPLOAD → PUT bytes →
+//                                   CREATE_LINKED_IN_POST with image URN
 //          linkedin + no media    → LINKEDIN_CREATE_LINKED_IN_POST
-//          linkedin + media       → V2 (requires multi-step upload); manual
 //     6. On success: update content_calendar.status='posted', post_url, posted_at
 //     7. On failure: update status='failed', engagement_notes, create alert
 //
@@ -26,8 +28,19 @@
 //   integration + the relevant settings rows), posts to that platform
 //   start succeeding automatically. No code change required.
 //
-// V1 SCOPE: text + image posts for Facebook; text-only for LinkedIn;
-//   Instagram always manual; image posts for LinkedIn are V2.
+// V2 SCOPE: text + image posts for Facebook AND LinkedIn; Instagram always
+//   manual; no carousels (multi-image posts) yet.
+//
+// LINKEDIN IMAGE FLOW (V2):
+//   1. Fetch bytes from content_calendar.media_url
+//   2. LINKEDIN_INITIALIZE_IMAGE_UPLOAD with owner=author_urn
+//        → returns { image: <urn>, uploadUrl: <presigned PUT url> }
+//   3. PUT image bytes to uploadUrl with Content-Type from fetch
+//   4. LINKEDIN_CREATE_LINKED_IN_POST with images=[{name, mimetype, s3key: <urn>}]
+//        — passing the URN through the file_uploadable s3key field is the
+//        Composio-recommended pattern when the asset is already in LinkedIn's
+//        storage rather than Composio's S3.
+//   Failure at ANY step → status='failed' + alert with diagnostic detail.
 // =========================================================================
 
 // deno-lint-ignore-file no-explicit-any
@@ -41,6 +54,11 @@ const sb = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
 });
 
 const COMPOSIO_BASE = "https://backend.composio.dev/api/v3/tools/execute";
+
+// LinkedIn image upload limits (per LinkedIn API docs as of 2026)
+const LI_IMAGE_MAX_BYTES = 5 * 1024 * 1024; // 5 MB for feed-share images
+const MEDIA_FETCH_TIMEOUT_MS = 30_000;
+const PUT_TIMEOUT_MS = 60_000;
 
 function jsonResponse(body: any, status = 200): Response {
   return new Response(JSON.stringify(body, null, 2), {
@@ -87,6 +105,109 @@ function composeFullText(caption: string | null, hashtags: string[] | null): str
   const cap = (caption || "").trim();
   const tags = (hashtags || []).filter(t => typeof t === "string" && t.trim()).join(" ");
   return tags ? `${cap}\n\n${tags}` : cap;
+}
+
+// Derive a sensible filename + mimetype for the LinkedIn images[] payload.
+// LinkedIn's API doesn't strictly validate filename, but the field is required.
+function deriveImageMeta(mediaUrl: string, contentTypeHeader: string | null): { name: string; mimetype: string } {
+  let name = "image.jpg";
+  try {
+    const u = new URL(mediaUrl);
+    const last = u.pathname.split("/").filter(Boolean).pop();
+    if (last && /\.[a-zA-Z0-9]{2,5}$/.test(last)) name = last;
+  } catch { /* ignore */ }
+
+  let mimetype = (contentTypeHeader || "").split(";")[0].trim().toLowerCase();
+  if (!mimetype || !mimetype.startsWith("image/")) {
+    // Fall back from filename extension
+    const ext = (name.split(".").pop() || "").toLowerCase();
+    const extMap: Record<string, string> = {
+      jpg: "image/jpeg", jpeg: "image/jpeg",
+      png: "image/png",  gif: "image/gif",
+      webp: "image/webp", heic: "image/heic",
+    };
+    mimetype = extMap[ext] || "image/jpeg";
+  }
+  return { name, mimetype };
+}
+
+interface LinkedInUploadResult {
+  imageUrn: string;
+  name: string;
+  mimetype: string;
+}
+
+// Native LinkedIn image upload: INITIALIZE_IMAGE_UPLOAD → fetch source → PUT bytes.
+// Returns the LinkedIn image URN ready to attach to a CREATE_POST call,
+// or throws with a diagnostic message.
+async function linkedInUploadImage(opts: {
+  apiKey: string;
+  userId: string;
+  connectedAccountId: string;
+  authorUrn: string;
+  mediaUrl: string;
+}): Promise<LinkedInUploadResult> {
+  // 1. Initialize upload — get URN + presigned PUT URL
+  const init = await callComposio({
+    apiKey: opts.apiKey, userId: opts.userId,
+    connectedAccountId: opts.connectedAccountId,
+    toolSlug: "LINKEDIN_INITIALIZE_IMAGE_UPLOAD",
+    toolArguments: { owner: opts.authorUrn },
+  });
+  if (!init.ok) {
+    throw new Error(`INITIALIZE_IMAGE_UPLOAD (http=${init.httpStatus}): ${init.error}`);
+  }
+  const imageUrn: string | null = init.data?.image ?? null;
+  const uploadUrl: string | null = init.data?.uploadUrl ?? null;
+  if (!imageUrn || !uploadUrl) {
+    throw new Error(`INITIALIZE_IMAGE_UPLOAD returned malformed data: ${JSON.stringify(init.data).slice(0, 300)}`);
+  }
+
+  // 2. Fetch bytes from the source media URL
+  const ac1 = new AbortController();
+  const t1 = setTimeout(() => ac1.abort(), MEDIA_FETCH_TIMEOUT_MS);
+  let bytes: Uint8Array;
+  let contentTypeHeader: string | null;
+  try {
+    const fetchRes = await fetch(opts.mediaUrl, { signal: ac1.signal });
+    if (!fetchRes.ok) {
+      throw new Error(`media_url fetch returned ${fetchRes.status} ${fetchRes.statusText}`);
+    }
+    const ab = await fetchRes.arrayBuffer();
+    bytes = new Uint8Array(ab);
+    contentTypeHeader = fetchRes.headers.get("content-type");
+  } finally {
+    clearTimeout(t1);
+  }
+
+  if (bytes.byteLength === 0) {
+    throw new Error(`media_url returned 0 bytes: ${opts.mediaUrl}`);
+  }
+  if (bytes.byteLength > LI_IMAGE_MAX_BYTES) {
+    throw new Error(`Image too large for LinkedIn feed share: ${bytes.byteLength} bytes (max ${LI_IMAGE_MAX_BYTES}).`);
+  }
+
+  const { name, mimetype } = deriveImageMeta(opts.mediaUrl, contentTypeHeader);
+
+  // 3. PUT bytes to LinkedIn's presigned upload URL
+  const ac2 = new AbortController();
+  const t2 = setTimeout(() => ac2.abort(), PUT_TIMEOUT_MS);
+  try {
+    const putRes = await fetch(uploadUrl, {
+      method: "PUT",
+      body: bytes,
+      headers: { "Content-Type": mimetype },
+      signal: ac2.signal,
+    });
+    if (!putRes.ok) {
+      const errText = (await putRes.text().catch(() => "")).slice(0, 300);
+      throw new Error(`PUT to LinkedIn uploadUrl failed: ${putRes.status} ${putRes.statusText} — ${errText}`);
+    }
+  } finally {
+    clearTimeout(t2);
+  }
+
+  return { imageUrn, name, mimetype };
 }
 
 interface PostResult {
@@ -168,15 +289,8 @@ async function postOne(opts: {
     return { outcome: "posted", post_url: postUrl };
   }
 
-  // ----- LinkedIn (text-only V1; image posts are V2) -----
+  // ----- LinkedIn (V2 — text + single image) -----
   if (platform === "linkedin") {
-    if (mediaUrl) {
-      return {
-        outcome: "requires_manual",
-        error: "LinkedIn image posts require a 3-step upload flow (register → initialize → create); planned for V2. Post the image manually for now.",
-      };
-    }
-
     const authorUrn = await getSetting(opts.agencyId, "linkedin_author_urn");
     if (!authorUrn) {
       return {
@@ -185,19 +299,57 @@ async function postOne(opts: {
       };
     }
 
+    // If media_url is present, run the V2 native upload flow first.
+    // The image URN we get back gets attached to the CREATE_POST call.
+    let imageAttachment: LinkedInUploadResult | null = null;
+    if (mediaUrl) {
+      try {
+        imageAttachment = await linkedInUploadImage({
+          apiKey: opts.apiKey,
+          userId: opts.userId,
+          connectedAccountId: accountId,
+          authorUrn,
+          mediaUrl,
+        });
+      } catch (err) {
+        return {
+          outcome: "failed",
+          error: `LinkedIn image upload failed: ${(err as Error).message}`,
+        };
+      }
+    }
+
+    const toolArgs: Record<string, any> = {
+      author: authorUrn,
+      commentary: fullText.slice(0, 3000),
+      visibility: "PUBLIC",
+      lifecycleState: "PUBLISHED",
+    };
+    if (imageAttachment) {
+      // Pass the LinkedIn-native image URN through the file_uploadable s3key
+      // field. This is the Composio convention for "this asset already lives
+      // in the target platform's storage, just reference it by ID".
+      toolArgs.images = [{
+        name:     imageAttachment.name,
+        mimetype: imageAttachment.mimetype,
+        s3key:    imageAttachment.imageUrn,
+      }];
+    }
+
     const r = await callComposio({
       apiKey: opts.apiKey, userId: opts.userId,
       connectedAccountId: accountId,
       toolSlug: "LINKEDIN_CREATE_LINKED_IN_POST",
-      toolArguments: {
-        author: authorUrn,
-        commentary: fullText.slice(0, 3000),
-        visibility: "PUBLIC",
-        lifecycleState: "PUBLISHED",
-      },
+      toolArguments: toolArgs,
     });
     if (!r.ok) {
-      return { outcome: "failed", error: `LINKEDIN_CREATE_LINKED_IN_POST (http=${r.httpStatus}): ${r.error}` };
+      const hint = imageAttachment
+        ? " (V2 native upload succeeded but CREATE_POST rejected the image URN — verify Composio's images[].s3key accepts LinkedIn URNs; the URN itself was: " + imageAttachment.imageUrn + ")"
+        : "";
+      return {
+        outcome: "failed",
+        error: `LINKEDIN_CREATE_LINKED_IN_POST (http=${r.httpStatus}): ${r.error}${hint}`,
+      };
     }
     const postUrn: string | null = r.data?.id ?? r.data?.urn ?? null;
     const postUrl = postUrn ? `https://www.linkedin.com/feed/update/${postUrn}` : null;
@@ -207,7 +359,7 @@ async function postOne(opts: {
   // Any other platform — manual
   return {
     outcome: "requires_manual",
-    error: `Platform "${platform}" is not yet supported by the social-media-scheduler. Supported: facebook, linkedin (text-only), instagram (manual). Post manually for now.`,
+    error: `Platform "${platform}" is not yet supported by the social-media-scheduler. Supported: facebook, linkedin, instagram (manual). Post manually for now.`,
   };
 }
 

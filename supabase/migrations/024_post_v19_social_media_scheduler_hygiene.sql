@@ -1,6 +1,6 @@
--- =========================================================================
+-- =============================================================================
 -- Migration: 024_post_v19_social_media_scheduler_hygiene
--- =========================================================================
+-- =============================================================================
 -- Encodes two direct-UPDATE drifts from S10 and S20 into a versioned migration
 -- so fresh installs reach the same end-state automatically:
 --
@@ -14,7 +14,7 @@
 -- TEMPLATE-SAFE: filters by recipe_name only, no hardcoded agency UUIDs.
 -- IDEMPOTENT: WHERE clauses make a re-run a no-op.
 -- MULTI-TENANT-SAFE: applies to every install's Social Media Scheduler row.
--- =========================================================================
+-- =============================================================================
 
 -- Step 1: Activate Social Media Scheduler.
 -- V2 handles all platforms gracefully (instagram always manual; others fall to
@@ -33,7 +33,7 @@ WHERE recipe_name = 'Social Media Scheduler'
 UPDATE public.automation_recipes
 SET
     recipe_description =
-        'Pulls today's's content_calendar items and posts each to its platform '
+        'Pulls today''s content_calendar items and posts each to its platform '
         'via Composio. V2 supports: Facebook text + photo, LinkedIn text + '
         'single image (native LINKEDIN_INITIALIZE_IMAGE_UPLOAD -> PUT bytes -> '
         'CREATE_LINKED_IN_POST with images[].s3key=URN). Instagram is always '
@@ -94,7 +94,7 @@ BEGIN
           v_in_post_state, v_total;
     ELSE
         RAISE NOTICE
-          'Migration 024: %/% Social Media Scheduler row() in expected V2 state.',
+          'Migration 024: %/% Social Media Scheduler row(s) in expected V2 state.',
           v_in_post_state, v_total;
     END IF;
 END $$;

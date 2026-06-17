@@ -42,6 +42,20 @@
 //   on a second run).
 //
 // =========================================================================
+// V2.4 OBSERVABILITY (2026-06-17):
+//   - automation_run_log gained a `metadata` jsonb column (migration 025).
+//     This function now populates it with per-run structured detail:
+//       version, path (V1/V2), messages_total, messages_archived,
+//       messages_failed, messages_skipped_already_archived,
+//       attachments_uploaded, documents_inserted, modify_error,
+//       per_message_errors (array of {messageId, error}), archive_query
+//   - Status semantics tightened: per-message processing failures now
+//     flip status to "failed" (previously: silent success with summary
+//     mention only). The V1 docs-insert-failure path likewise now reports
+//     status=failed instead of success. Monitoring filtering on
+//     status='failed' will now catch every partial-failure mode.
+//
+// =========================================================================
 // LIMITS (V2.0):
 //   - Single attachments > 5MB are skipped (GOOGLEDRIVE_UPLOAD_FILE cap).
 //     V2.1 will switch to GOOGLEDRIVE_RESUMABLE_UPLOAD for large files.
@@ -475,8 +489,17 @@ Deno.serve(async (req: Request) => {
     return jsonResponse({ error: "Unauthorized: invalid shared_secret" }, 401);
   }
 
-  // Helper to write the run log + recipe status, always once at the end
-  async function writeOutcome(status: "success" | "failed", recordsProcessed: number, summary: string, errorMessage: string | null) {
+  // Helper to write the run log + recipe status, always once at the end.
+  // V2.4: accepts optional metadata jsonb for structured per-run detail
+  // (per-message errors, version markers, stage counts). Defaults to {}
+  // so existing call sites keep compiling cleanly.
+  async function writeOutcome(
+    status: "success" | "failed",
+    recordsProcessed: number,
+    summary: string,
+    errorMessage: string | null,
+    metadata: Record<string, any> = {},
+  ) {
     const durationSec = Math.round((Date.now() - started) / 1000);
     await sb.from("automation_run_log").insert({
       agency_id: agencyId,
@@ -486,6 +509,7 @@ Deno.serve(async (req: Request) => {
       error_message: errorMessage,
       duration_seconds: durationSec,
       output_summary: summary,
+      metadata,
     });
     await sb.from("automation_recipes").update({ last_run_status: status }).eq("id", recipeId);
   }
@@ -549,7 +573,12 @@ Deno.serve(async (req: Request) => {
 
     if (messages.length === 0) {
       const summary = `0 emails match archive query "${archiveQuery}". Nothing to archive.`;
-      await writeOutcome("success", 0, summary, null);
+      await writeOutcome("success", 0, summary, null, {
+        version: "V2.4",
+        path: routeAttachmentsToDrive ? "V2" : "V1",
+        messages_total: 0,
+        archive_query: archiveQuery,
+      });
       return jsonResponse({
         ok: true,
         recipe_id: recipeId,
@@ -628,26 +657,43 @@ Deno.serve(async (req: Request) => {
           .insert(docRows)
           .select("id");
         if (docErr) {
-          const partial = `Archived ${messageIds.length} emails; documents log INSERT failed: ${docErr.message}`;
-          await writeOutcome("success", messageIds.length, partial, null);
+          // V2.4: this used to silently report success because Gmail-side
+          // archival had already happened. But documents-table tracking
+          // failed, leaving the row count out of sync — a real partial
+          // failure that monitoring filtering on status='failed' missed.
+          const partial = `V1 partial: archived ${messageIds.length} emails; documents log INSERT failed: ${docErr.message}`;
+          await writeOutcome("failed", messageIds.length, partial, docErr.message, {
+            version: "V2.4",
+            path: "V1",
+            messages_archived: messageIds.length,
+            documents_inserted: 0,
+            documents_insert_error: docErr.message,
+            archive_query: archiveQuery,
+          });
           return jsonResponse({
-            ok: true,
+            ok: false,
             recipe_id: recipeId,
             recipe_name: recipe.recipe_name,
-            status: "success",
+            status: "failed",
             records_processed: messageIds.length,
             documents_inserted: 0,
             documents_insert_error: docErr.message,
             archive_query: archiveQuery,
             mode: "v1",
             output_summary: partial,
-          }, 200);
+          }, 500);
         }
         docsInserted = (insertedDocs?.length ?? 0);
       }
 
       const summary = `Archived ${messageIds.length} emails matching "${archiveQuery}"; ${docsInserted} rows logged to documents.`;
-      await writeOutcome("success", messageIds.length, summary, null);
+      await writeOutcome("success", messageIds.length, summary, null, {
+        version: "V2.4",
+        path: "V1",
+        messages_archived: messageIds.length,
+        documents_inserted: docsInserted,
+        archive_query: archiveQuery,
+      });
 
       return jsonResponse({
         ok: true,
@@ -957,12 +1003,49 @@ Deno.serve(async (req: Request) => {
     if (docsInsertError) summaryParts.push(`documents insert error: ${docsInsertError}`);
     const summary = summaryParts.join("; ");
 
-    // Run is "success" if we made any forward progress AND there's no
-    // catastrophic batch-level failure. Per-message errors are reported
-    // in the summary but don't fail the run; messages stay in inbox.
+    // V2.4: per-message processing errors now flip status to "failed". The
+    // V2.3 design left these as "success" on the theory that the affected
+    // message stays in the inbox for the next run to retry — true, but that
+    // made silent partial regressions invisible to monitoring filtering on
+    // status='failed'. The metadata jsonb below preserves the full per-message
+    // detail for triage. For a once-daily cron this means stuck messages
+    // surface on the next run instead of accumulating silently.
+    const hasPerMessageErrors = perMessageErrors.length > 0;
     const runStatus: "success" | "failed" =
-      (modifyError || docsInsertError) ? "failed" : "success";
-    await writeOutcome(runStatus, archivedMessageIds.length, summary, modifyError || docsInsertError);
+      (modifyError || docsInsertError || hasPerMessageErrors) ? "failed" : "success";
+
+    // Build a compact error_message that prioritizes the batch-level errors
+    // (modify, docs-insert) and falls back to a sampled summary of per-message
+    // errors. Capped at 1000 chars to keep the column tractable.
+    const errMsgParts: string[] = [];
+    if (modifyError) errMsgParts.push(modifyError);
+    if (docsInsertError) errMsgParts.push(`documents insert: ${docsInsertError}`);
+    if (hasPerMessageErrors && !modifyError) {
+      const sample = perMessageErrors.slice(0, 3)
+        .map((e) => `${e.messageId}=${e.error.slice(0, 120)}`)
+        .join("; ");
+      const more = perMessageErrors.length > 3 ? "; ..." : "";
+      errMsgParts.push(`${perMessageErrors.length} per-message errors: ${sample}${more}`);
+    }
+    const errMsg = errMsgParts.length > 0 ? errMsgParts.join(" | ").slice(0, 1000) : null;
+
+    const v2Metadata: Record<string, any> = {
+      version: "V2.4",
+      path: "V2",
+      messages_total: messageIds.length,
+      messages_archived: archivedMessageIds.length,
+      messages_failed: perMessageErrors.length,
+      messages_skipped_already_archived: skippedMessageIds.length,
+      attachments_uploaded: totalAttachmentsUploaded,
+      attachments_skipped_size: totalAttachmentsSkippedSize,
+      documents_inserted: docsInserted,
+      documents_insert_error: docsInsertError,
+      modify_error: modifyError,
+      per_message_errors: perMessageErrors,
+      archive_query: archiveQuery,
+    };
+
+    await writeOutcome(runStatus, archivedMessageIds.length, summary, errMsg, v2Metadata);
 
     return jsonResponse({
       ok: runStatus === "success",
@@ -986,7 +1069,11 @@ Deno.serve(async (req: Request) => {
 
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await writeOutcome("failed", 0, `Failed: ${msg.slice(0, 200)}`, msg);
+    await writeOutcome("failed", 0, `Failed: ${msg.slice(0, 200)}`, msg, {
+      version: "V2.4",
+      path: "unknown",
+      crash: msg.slice(0, 1000),
+    });
     return jsonResponse({ ok: false, error: msg }, 500);
   }
 });
